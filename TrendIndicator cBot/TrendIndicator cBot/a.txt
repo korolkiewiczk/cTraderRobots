@@ -1,0 +1,208 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Net;
+using System.Threading;
+using cAlgo.API;
+using cAlgo.API.Extensions;
+using cAlgo.API.Extensions.Enums;
+using cAlgo.API.Extensions.Models;
+using cAlgo.API.Indicators;
+using cAlgo.API.Internals;
+using cAlgo.Indicators;
+
+namespace cAlgo.Robots
+{
+    [Robot(TimeZone = TimeZones.UTC, AccessRights = AccessRights.None)]
+    public class TrendIndicatorCBot : CBotBase
+    {
+        [Parameter("Trend indicator period", Group = "TrendIndicator", DefaultValue = 24, MinValue = 1, Step = 1)]
+        public int TrendIndicatorPeriod { get; set; }
+
+        [Parameter("Atr period", Group = "ATR", DefaultValue = 14, MinValue = 1, Step = 1)]
+        public int AtrPeriod { get; set; }
+
+        [Parameter("TP factor", Group = "Money", DefaultValue = 5, MinValue = 1)]
+        public double TpFactor { get; set; }
+
+        [Parameter("Close factor B", Group = "Money", DefaultValue = 0.2, MinValue = 0)]
+        public double CloseFactorB { get; set; }
+
+        [Parameter("Close factor S", Group = "Money", DefaultValue = 0.2, MinValue = 0)]
+        public double CloseFactorS { get; set; }
+
+        [Parameter("Atr multiplier", Group = "Money", DefaultValue = 8, MinValue = 0.001)]
+        public double AtrMultiplier { get; set; }
+
+        [Parameter("Risk", Group = "Money", DefaultValue = 1)]
+        public double Risk { get; set; }
+
+        [Parameter("StdDev Risk Threshold", Group = "Money", DefaultValue = 0.002)]
+        public double StdDevRiskThreshold { get; set; }
+
+        [Parameter("Check Ema StdDev", Group = "Money", DefaultValue = false)]
+        public bool CheckEmaStdDev { get; set; }
+
+        private IndicatorDataSeries _ema;
+        private StandardDeviation _stdDev;
+        private AverageTrueRange _atr;
+        private TrendIndicator _trendIndicator;
+
+        private bool _isRising;
+
+        protected override void OnStart()
+        {
+            _ema = Indicators.ExponentialMovingAverage(Bars.ClosePrices, TrendIndicatorPeriod * 8).Result;
+            //_ema = Indicators.TimeSeriesMovingAverage(Bars.ClosePrices, TrendIndicatorPeriod * 8).Result;
+            _stdDev = Indicators.StandardDeviation(Bars.ClosePrices, TrendIndicatorPeriod * 8, MovingAverageType.Exponential);
+            _atr = Indicators.AverageTrueRange(AtrPeriod, MovingAverageType.Exponential);
+            _trendIndicator = Indicators.GetIndicator<TrendIndicator>(TrendIndicatorPeriod, Bars.ClosePrices);
+        }
+
+        protected override void OnBar()
+        {
+            OnTrade(Risk, TpFactor);
+        }
+
+        protected override void OnStop()
+        {
+            var longPositions = Positions.FindAll(_label, SymbolName, TradeType.Buy);
+            var shortPositions = Positions.FindAll(_label, SymbolName, TradeType.Sell);
+            foreach (var position in longPositions)
+            {
+                position.Close();
+            }
+
+            foreach (var position in shortPositions)
+            {
+                position.Close();
+            }
+        }
+
+        public TrendIndicatorCBot() : base("TrendIndicatorCBot")
+        {
+        }
+
+        protected override TradeType? GetSignal()
+        {
+            if (!_trendIndicator.Result.IsRising())
+            {
+                var longPositions = Positions.FindAll(_label, SymbolName, TradeType.Buy);
+                var shortPositions = Positions.FindAll(_label, SymbolName, TradeType.Sell);
+                foreach (var position in longPositions)
+                {
+                    var closeFactor = Risk * Account.Equity * CloseFactorB / 100;
+                    if (position.NetProfit < closeFactor)
+                        continue;
+                    position.Close();
+                }
+
+                foreach (var position in shortPositions)
+                {
+                    var closeFactor = Risk * Account.Equity * CloseFactorS / 100;
+                    if (position.NetProfit < closeFactor)
+                        continue;
+                    position.Close();
+                }
+
+                _isRising = false;
+                return null;
+            }
+
+            if (_stdDev.Result.LastValue > StdDevRiskThreshold)
+            {
+                _isRising = true;
+                return null;
+            }
+
+            if (_isRising)
+                return null;
+
+            var buy = _ema.IsRising();
+            var sell = _ema.IsFalling();
+
+            var sig = (buy ? 1 : 0) + (sell ? -1 : 0);
+
+            if (CheckEmaStdDev)
+            {
+                if (Bars.LastBar.Close < _ema.LastValue - _stdDev.Result.LastValue * 2 || Bars.LastBar.Close > _ema.LastValue + _stdDev.Result.LastValue * 2)
+                    sig = -sig;
+            }
+
+            return GetTradeType(sig);
+        }
+
+        protected override double GetStopLoss()
+        {
+            var atrVal = _atr.Result.LastValue;
+            var atrSl = Symbol.ToPips(atrVal) * AtrMultiplier;
+            return atrSl;
+        }
+
+        protected override TradeType Filter(TradeType tradeType, ref double stopLossInPips, ref double risk)
+        {
+            return tradeType;
+        }
+
+        #region Fit
+        protected override double GetFitness(GetFitnessArgs args)
+        {
+            if (args.History.Count < 10)
+                return -100;
+            var balance0 = args.History[0].Balance;
+            var balanceData = args.History.Select(x => x.Balance / balance0 - 1).ToList();
+            var ls = GetLeastSquaresRegression(balanceData);
+            var balanceX2X = balanceData.Count * 2 * ls.Slope + ls.Intercept;
+            double dev = 0;
+            for (int i = 0; i < balanceData.Count; i++)
+            {
+                var y = i * ls.Slope + ls.Intercept;
+                var b = balanceData[i];
+                dev += (y - b) * (y - b);
+            }
+
+            dev /= balanceData.Count;
+            dev = Math.Sqrt(dev);
+            if (Math.Abs(dev) < 1E-09)
+                dev = 1;
+            dev = 1 / dev;
+            dev = dev < 1E-07 ? 1 : dev;
+            return balanceX2X * dev * Math.Log(balanceData.Count);
+        }
+
+        private static LeastSquares GetLeastSquaresRegression(IList<double> data)
+        {
+            var xValues = new List<int>();
+            var yValues = new List<double>();
+
+            for (var x = 0; x < data.Count; x++)
+            {
+                xValues.Add(x);
+                yValues.Add(data[x]);
+            }
+
+            var xSquared = xValues.Select(x => Math.Pow(x, 2)).ToList();
+            var xyProducts = xValues.Zip(yValues, (x, y) => x * y).ToList();
+
+            double xSum = xValues.Sum();
+            var ySum = yValues.Sum();
+
+            var xSqauredSum = xSquared.Sum();
+
+            var xyProductsSum = xyProducts.Sum();
+
+            var n = xValues.Count;
+
+            var slope = (n * xyProductsSum - xSum * ySum) / (n * xSqauredSum - Math.Pow(xSum, 2));
+            var intercept = (ySum - slope * xSum) / n;
+
+            return new LeastSquares 
+            {
+                Slope = slope,
+                Intercept = intercept
+            };
+        }
+        #endregion
+    }
+}
